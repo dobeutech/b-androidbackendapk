@@ -39,6 +39,10 @@ Status: **pending approval** — not yet executed.
    is provisioned, how billing works, and how to deploy.
 10. `CHANGELOG.md` exists and `versionCode`/`versionName` are bumped to reflect the first sellable
     release.
+11. `npm audit` on `firebase-backend/functions` reports zero critical/high vulnerabilities in
+    production dependencies (dev-only tooling deps may remain, tracked separately); the GitHub
+    Dependabot alert count for the default branch has a documented remediation status (fixed,
+    accepted-risk, or false-positive) for every critical/high finding — not left unaddressed.
 
 ## Implementation Steps
 
@@ -59,40 +63,75 @@ Status: **pending approval** — not yet executed.
    workflow already assumes it exists.
 5. Add `.gitattributes` (`* text=auto eol=lf`) per the portfolio's repo onboarding gate 1.
 
+### Phase 0.5 — Critical/high CVE triage
+
+GitHub reports 112 open Dependabot alerts on the default branch (4 critical, 49 high, 50
+moderate, 9 low), spanning both the npm and (likely) Gradle/Android ecosystems. A local
+`npm audit` against `firebase-backend/functions` confirms the npm side: **41 vulnerabilities (3
+critical, 20 high, 16 moderate, 2 low)**, and — importantly — every critical and almost every high
+finding already has a non-major fix available via `npm audit fix`:
+
+- **Critical, fix available**: `websocket-driver` (<=0.7.4, resource-limit bypass + message
+  corruption), `protobufjs` (<=7.6.4, arbitrary code execution + several DoS/prototype-injection
+  advisories), `fast-xml-parser` (<=5.6.0, entity-expansion DoS + XML injection).
+- **High, fix available (non-major)**: `express` (4.x/5.x ReDoS-adjacent chain), `axios` (long list
+  including SSRF, prototype pollution, credential leakage), `js-yaml`, `lodash`, `node-forge`,
+  `jws`, `form-data`, `glob`, `brace-expansion`, `browserslist`, `flatted`, `picomatch`,
+  `path-to-regexp`, `@grpc/grpc-js`.
+- **High, only fixable via a major bump**: the `@typescript-eslint/*` toolchain and `minimatch`
+  (transitively via `@typescript-eslint/parser`) — these are dev-only lint/build tooling, not
+  runtime-exposed, so a major bump is lower risk to schedule here than a runtime dependency would
+  be.
+
+6. Run `npm audit fix` in `firebase-backend/functions` to clear every critical and the bulk of
+    high findings that don't require a major version bump; re-run `npm audit` to confirm.
+7. Bump `@typescript-eslint/eslint-plugin`, `@typescript-eslint/parser`, and their peers to 8.70.0
+    (major bump, dev-only — verify lint still runs clean after).
+8. After Phase 0 steps 1–2 land (canonical backend, `middleware/` files exist), re-run
+    `npm run build && npm test` to confirm the dependency bumps didn't break the build.
+9. Check the Android/Gradle side of the 112 Dependabot alerts once the Gradle wrapper is
+    committed (Phase 0 step 4) — GitHub's Dependabot UI or `./gradlew dependencies` /
+    `dependencyCheckAnalyze` can surface outdated Firebase BOM, OkHttp, Retrofit, or other
+    transitive versions with known CVEs. Update pinned versions in
+    `android-app/app/build.gradle` accordingly.
+10. For anything left unresolved (moderate/low, or a high that truly requires a breaking runtime
+    change this timeline can't absorb), record an explicit accepted-risk note rather than leaving
+    it silently open — this is what enterprise security review will ask about.
+
 ### Phase 1 — Real billing (the actual "monetized" part)
 
-6. Implement Stripe Checkout + a webhook handler in a new
+11. Implement Stripe Checkout + a webhook handler in a new
    `firebase-backend/functions/src/services/stripe-service.ts`: a `createCheckoutSession`
    endpoint, and a `stripeWebhook` endpoint that verifies `stripe.webhooks.constructEvent` and
    updates Firestore only on `checkout.session.completed` / `customer.subscription.updated`.
-7. Lock down `updateSubscription` in the canonical API so plan changes only happen via the
+12. Lock down `updateSubscription` in the canonical API so plan changes only happen via the
    verified webhook or an authenticated admin-only override — remove the current unauthenticated
    direct-write path in `subscription-service.js`.
-8. Add/verify Firestore security rules so a client cannot write `planId` directly
+13. Add/verify Firestore security rules so a client cannot write `planId` directly
    (`firebase-backend/firestore.rules`).
 
 ### Phase 2 — Ship-readiness
 
-9. Add a real release signing config in `android-app/app/build.gradle` (new keystore, secrets via
+14. Add a real release signing config in `android-app/app/build.gradle` (new keystore, secrets via
    `local.properties`/CI secrets, never committed).
-10. Bump `versionCode`/`versionName`; add `CHANGELOG.md`.
-11. Fix CI now that the wrapper exists (`android-build.yml`, `ci.yml`,
+15. Bump `versionCode`/`versionName`; add `CHANGELOG.md`.
+16. Fix CI now that the wrapper exists (`android-build.yml`, `ci.yml`,
     `integration-tests.yml`); remove or keep-guarded the `web-dashboard` CI steps since it's
     deferred.
-12. Write `docs/ARCHITECTURE.md` and `docs/OPERATIONS.md` by mining the existing root-level
+17. Write `docs/ARCHITECTURE.md` and `docs/OPERATIONS.md` by mining the existing root-level
     planning docs (`APK_MIGRATION_PLAN.md`, `FIREBASE_BACKEND_SPEC.md`,
     `IMPLEMENTATION_SUMMARY.md`, etc.) rather than starting from scratch.
-13. Write a minimal `SECURITY.md` and a real `.env.example` (Stripe keys, Firebase project vars —
+18. Write a minimal `SECURITY.md` and a real `.env.example` (Stripe keys, Firebase project vars —
     placeholders only).
-14. Draft a Privacy Policy, ToS, and a one-page data-processing summary tailored to the enterprise
+19. Draft a Privacy Policy, ToS, and a one-page data-processing summary tailored to the enterprise
     MDM model (company-owned devices, employee notice, retention periods pulled from the existing
     `subscription-service.js` retention-days fields).
 
 ### Phase 3 — Verify
 
-15. Run the full test suite (Android unit + instrumented, backend integration against the Firestore
-    emulator); fix anything the canonicalization work broke.
-16. Manual smoke test: register a test company → subscribe via Stripe test mode → enroll one
+20. Run the full test suite (Android unit + instrumented, backend integration against the Firestore
+    emulator); fix anything the canonicalization or dependency-bump work broke.
+21. Manual smoke test: register a test company → subscribe via Stripe test mode → enroll one
     Android device → confirm metrics flow to Firestore → confirm plan-gated enforcement works
     (e.g., hitting the device limit blocks further enrollment).
 
@@ -129,13 +168,19 @@ Status: **pending approval** — not yet executed.
   deferred.
 - **CI is very likely fully broken today** (no committed wrapper) — until Phase 0 step 4 lands,
   there is no CI signal at all; verify everything locally first.
+- **112 open Dependabot alerts (4 critical, 49 high)** — an enterprise buyer's security review will
+  ask about this directly. *Mitigation*: Phase 0.5 clears the npm-side criticals/highs (mostly a
+  non-major `npm audit fix`); the Android/Gradle side needs a pass once the wrapper is restored.
+  Anything genuinely deferred must be an explicit accepted-risk note, not silence.
 
 ## Verification Steps
 
 - `cd firebase-backend/functions && npm run build` exits 0.
 - `cd android-app && ./gradlew build` exits 0 (after the wrapper is committed).
+- `cd firebase-backend/functions && npm audit` reports 0 critical/high (or only documented
+  accepted-risk exceptions).
 - `cd firebase-backend/functions && npm test` (against the Firestore emulator) passes, including
   new Stripe/webhook tests.
-- Manual Stripe test-mode end-to-end flow (Phase 3, step 16).
+- Manual Stripe test-mode end-to-end flow (Phase 3, step 21).
 - Run `node repos/_standards/checks/check-amplitude.mjs androidbackendapk` and record the verdict
   — even a deliberate "defer" decision should be on record, not just unassessed.
